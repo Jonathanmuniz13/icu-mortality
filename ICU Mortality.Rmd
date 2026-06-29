@@ -1,0 +1,962 @@
+---
+title: "WiDS 2020 ICU Mortality: Interpretable Exploration + LightGBM Submission"
+author: 'Jonathan Muniz'
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo       = TRUE,
+  warning    = FALSE,
+  message    = FALSE,
+  fig.width  = 10,
+  fig.height = 6.5,
+  fig.align  = "center",
+  out.width  = "100%",
+  dpi        = 300
+)
+
+# ── Load packages ──────────────────────────────────────────────────────────
+# install.packages(c('tidyverse','skimr','broom','pROC','knitr','scales',
+#                     'patchwork','ggcorrplot','car','kableExtra'))
+
+library(tidyverse)
+library(skimr)
+library(broom)
+library(pROC)
+library(knitr)
+library(scales)
+library(patchwork)
+library(forcats)
+library(ggcorrplot)
+library(car)
+library(lightgbm)
+library(caret)
+
+# ── Custom theme ───────────────────────────────────────────────────────────
+theme_proj <- function(base_size = 12) {
+  theme_minimal(base_size = base_size) %+replace%
+    theme(
+      plot.title       = element_text(face = "bold", size = rel(1.15),
+                                      hjust = 0, margin = margin(b = 8)),
+      plot.subtitle    = element_text(color = "grey40", margin = margin(b = 10)),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey90"),
+      axis.title       = element_text(size = rel(0.9)),
+      strip.text       = element_text(face = "bold"),
+      legend.position  = "bottom"
+    )
+}
+
+# ── Colorblind-safe outcome palette ────────────────────────────────────────
+# Consistent across all outcome-based plots.
+# Muted blue = Survived, Deep coral = Died (intuitive severity mapping)
+outcome_pal <- c("Survived" = "#4477AA", "Died" = "#CC3311")
+```
+
+> **Kaggle notebook for the [WiDS Datathon 2020](https://www.kaggle.com/competitions/widsdatathon2020).**  
+> This notebook takes a two-track approach: an interpretable logistic regression for clinical 
+> insight, and a LightGBM model for leaderboard performance. Submission file: `submission_lgbm.csv`  
+> (5-fold CV AUC = **0.896**).
+
+# 1. Research Question
+
+**Question:** Which patient characteristics and first-day ICU measurements are most associated with in-hospital mortality?
+
+**Outcome:** `hospital_death` (0 = survived, 1 = died)
+
+**Approach:**
+
+- Start with descriptive summaries and missingness assessment.
+- Use clear exploratory plots to compare survivors vs non-survivors.
+- Fit a simple, interpretable logistic regression (primary model).
+- Report ROC AUC and a calibration plot as **apparent (in-sample) diagnostics**.
+
+# 2. Data Import and Basic Checks
+
+```{r load-data}
+data_path <- "training_v2.csv"  # keep the csv in the same folder as this .Rmd
+
+wi_ds <- readr::read_csv(data_path, show_col_types = FALSE)
+
+dim(wi_ds)
+names(wi_ds)[1:12]
+```
+
+```{r skim}
+skim_without_charts(wi_ds)
+```
+
+# 3. Variable Selection Strategy
+
+The dataset is wide. To keep the analysis interpretable, we:
+
+1. Focus on demographics + admission context + first-day vitals/labs.
+2. Avoid identifier fields (e.g., `encounter_id`, `patient_id`) as predictors.
+3. Avoid using derived probability scores (e.g., APACHE death probabilities) as main predictors.
+
+## 3.1 Candidate variables and missingness
+
+We start with an initial candidate set (including lactate), then inspect missingness and decide what stays.
+
+```{r candidate-missingness}
+candidate_vars <- c(
+  "hospital_death",
+  "age", "bmi", "gender", "ethnicity", "elective_surgery", "icu_type", "pre_icu_los_days",
+  "d1_heartrate_max", "d1_mbp_min", "d1_resprate_max", "d1_spo2_min", "d1_temp_max",
+  "d1_creatinine_max", "d1_bun_max", "d1_wbc_max", "d1_glucose_max", "d1_lactate_max"
+)
+
+candidate_df <- wi_ds %>% select(all_of(candidate_vars))
+
+candidate_missing <- candidate_df %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_missing") %>%
+  arrange(desc(pct_missing))
+
+kable(head(candidate_missing, 18), digits = 2,
+      caption = "Missingness (\\% missing) for candidate variables")
+```
+
+**Decision rule used here:** variables with extremely high missingness are not used in the primary model.
+
+In this dataset, `d1_lactate_max` has ~75% missingness, so we exclude it from the primary workflow. Lactate can still be explored separately as a supplemental analysis if desired.
+
+## 3.2 Final variable sets
+
+```{r define-vars}
+plot_vars <- c(
+  "hospital_death",
+  "age", "bmi", "gender", "ethnicity", "elective_surgery", "icu_type", "pre_icu_los_days",
+  "d1_heartrate_max", "d1_mbp_min", "d1_resprate_max", "d1_spo2_min", "d1_temp_max",
+  "d1_creatinine_max", "d1_bun_max", "d1_wbc_max", "d1_glucose_max"
+)
+
+model_vars <- c(
+  "hospital_death",
+  "age", "gender", "elective_surgery", "pre_icu_los_days",
+  "d1_mbp_min", "d1_spo2_min", "d1_resprate_max",
+  "d1_creatinine_max", "d1_bun_max", "d1_wbc_max"
+)
+
+lgbm_vars <- c(
+  "hospital_death",
+  # Demographics & admission
+  "age", "bmi", "gender", "ethnicity", "elective_surgery",
+  "pre_icu_los_days", "icu_type", "icu_admit_source", "hospital_admit_source",
+  # APACHE probability scores (strongest predictors in this dataset)
+  "apache_4a_hospital_death_prob", "apache_4a_icu_death_prob",
+  # APACHE component vitals/labs
+  "gcs_eyes_apache", "gcs_motor_apache", "gcs_verbal_apache",
+  "heart_rate_apache", "map_apache", "resprate_apache", "temp_apache",
+  "bun_apache", "creatinine_apache", "glucose_apache",
+  "hematocrit_apache", "sodium_apache", "wbc_apache",
+  "ventilated_apache", "intubated_apache", "arf_apache",
+  # Comorbidities
+  "aids", "cirrhosis", "diabetes_mellitus", "hepatic_failure",
+  "immunosuppression", "leukemia", "lymphoma", "solid_tumor_with_metastasis",
+  # Day-1 vitals (min & max)
+  "d1_heartrate_max", "d1_heartrate_min",
+  "d1_mbp_max", "d1_mbp_min",
+  "d1_resprate_max", "d1_resprate_min",
+  "d1_spo2_max", "d1_spo2_min",
+  "d1_sysbp_max", "d1_sysbp_min",
+  "d1_temp_max", "d1_temp_min",
+  # Day-1 labs
+  "d1_bun_max", "d1_creatinine_max", "d1_wbc_max",
+  "d1_glucose_max", "d1_glucose_min",
+  "d1_sodium_max", "d1_sodium_min",
+  "d1_potassium_max", "d1_potassium_min",
+  "d1_hco3_max", "d1_hco3_min",
+  "d1_platelets_max", "d1_platelets_min",
+  "d1_hemaglobin_max", "d1_hemaglobin_min",
+  "d1_albumin_min", "d1_lactate_max",
+  # Hour-1 vitals (early-warning signal)
+  "h1_heartrate_max", "h1_heartrate_min",
+  "h1_mbp_max", "h1_mbp_min",
+  "h1_resprate_max", "h1_spo2_min",
+  "h1_sysbp_max", "h1_sysbp_min"
+)
+```
+
+# 4. Build Analysis Datasets
+
+We intentionally create separate datasets:
+
+- **`df_plot`**: used for visualizations (not necessarily complete-case across all variables).
+- **`df_model`**: used for modeling (complete-case across *model variables only*).
+
+```{r build-datasets}
+# Plotting dataset
+df_plot <- wi_ds %>%
+  select(all_of(plot_vars)) %>%
+  mutate(
+    outcome          = factor(hospital_death, levels = c(0, 1),
+                              labels = c("Survived", "Died")),
+    gender           = factor(gender),
+    ethnicity        = factor(ethnicity),
+    elective_surgery = factor(elective_surgery, levels = c(0, 1),
+                              labels = c("No", "Yes")),
+    icu_type         = factor(icu_type)
+  )
+
+# Modeling dataset (complete-case on MODEL variables only)
+df_model <- wi_ds %>%
+  select(all_of(model_vars)) %>%
+  mutate(
+    outcome          = factor(hospital_death, levels = c(0, 1),
+                              labels = c("Survived", "Died")),
+    gender           = factor(gender),
+    elective_surgery = factor(elective_surgery, levels = c(0, 1),
+                              labels = c("No", "Yes")),
+    # Log-transform pre-ICU LOS to stabilize heavy right skew
+    # (raw: mean = 0.84 days, max = 159 days)
+    log_pre_icu_los  = log1p(pre_icu_los_days)
+  ) %>%
+  drop_na()
+
+# LightGBM dataset (complete-case on LGBM variables only)
+# LightGBM handles NA internally — no imputation or row-dropping needed.
+# Categorical columns must be integer-encoded; we save the factor levels
+# from training so the test set can be encoded identically
+
+encode_levels <- list()  # will store factor levels for test-set alignment
+
+df_lgbm <- wi_ds %>%
+  select(all_of(lgbm_vars)) %>%
+  mutate(across(
+    c(gender, ethnicity, icu_type, icu_admit_source, hospital_admit_source),
+    ~ {
+      f <- factor(.x)
+      encode_levels[[cur_column()]] <<- levels(f)
+      as.integer(f)
+    }
+  ))
+
+cat("LightGBM training rows:", nrow(df_lgbm), "\n")
+cat("LightGBM features:     ", ncol(df_lgbm) - 1, "\n")
+cat("Outcome prevalence:    ", round(mean(df_lgbm$hospital_death, na.rm = TRUE), 4), "\n")
+
+analysis_sizes <- tibble(
+  dataset = c("Full dataset", "Model complete-case"),
+  n_rows  = c(nrow(wi_ds), nrow(df_model))
+)
+
+kable(analysis_sizes, caption = "Dataset sizes used in this report")
+```
+
+## 4.1 Complete-case selection bias check
+
+Dropping rows with missing values can introduce bias if the dropped patients differ systematically from those retained. We compare mortality rates between the two groups.
+
+```{r cc-bias-check}
+cc_check <- wi_ds %>%
+  select(all_of(model_vars)) %>%
+  mutate(
+    complete_case  = complete.cases(pick(everything())),
+    hospital_death = as.numeric(hospital_death)
+  )
+
+bias_summary <- cc_check %>%
+  group_by(complete_case) %>%
+  summarise(
+    n         = n(),
+    mort_rate = mean(hospital_death, na.rm = TRUE),
+    mean_age  = mean(age, na.rm = TRUE),
+    .groups   = "drop"
+  ) %>%
+  mutate(complete_case = if_else(complete_case, "Retained", "Dropped"))
+
+kable(bias_summary, digits = 3,
+      caption = "Comparison of retained vs.\\ dropped observations (complete-case check)")
+```
+
+# 5. Exploratory Visualizations
+
+## 5.1 Outcome distribution
+
+```{r plot-outcome}
+plot_outcome <- ggplot(df_plot, aes(x = outcome, fill = outcome)) +
+  geom_bar(width = 0.7, show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.3,
+            fontface = "bold") +
+  scale_fill_manual(values = outcome_pal) +
+  labs(title    = "Distribution of Hospital Death Outcome",
+       subtitle = paste0("N = ", format(nrow(df_plot), big.mark = ","),
+                         " (",
+                         round(mean(df_plot$hospital_death == 1, na.rm = TRUE) * 100, 1),
+                         "% mortality)"),
+       x = NULL, y = "Count") +
+  theme_proj()
+
+plot_outcome
+```
+
+## 5.2 Missingness in selected Day-1 features
+
+```{r plot-missingness}
+missing_summary <- df_plot %>%
+  select(-outcome) %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100)) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_missing")
+
+plot_missing <- missing_summary %>%
+  filter(variable != "hospital_death") %>%
+  ggplot(aes(x = reorder(variable, pct_missing), y = pct_missing)) +
+  geom_col(fill = "#4477AA") +
+  coord_flip() +
+  labs(title = "Missing Data by Variable (Selected Features)",
+       x = NULL, y = "Percent missing") +
+  scale_y_continuous(labels = label_number(suffix = "%")) +
+  theme_proj()
+
+plot_missing
+```
+
+## 5.3 Correlation among continuous model predictors
+
+Before modeling, we inspect correlations among continuous predictors to identify potential multicollinearity. BUN and creatinine are both renal function markers and are expected to be correlated.
+
+```{r plot-corr-heatmap, fig.height=7}
+cont_model_vars <- c(
+  "age", "pre_icu_los_days",
+  "d1_mbp_min", "d1_spo2_min", "d1_resprate_max",
+  "d1_creatinine_max", "d1_bun_max", "d1_wbc_max"
+)
+
+cor_mat <- wi_ds %>%
+  select(all_of(cont_model_vars)) %>%
+  drop_na() %>%
+  cor(method = "pearson")
+
+# Readable labels
+heatmap_labels <- c(
+  age               = "Age",
+  pre_icu_los_days  = "Pre-ICU LOS",
+  d1_mbp_min        = "Min mean BP",
+  d1_spo2_min       = "Min SpO2",
+  d1_resprate_max   = "Max resp rate",
+  d1_creatinine_max = "Max creatinine",
+  d1_bun_max        = "Max BUN",
+  d1_wbc_max        = "Max WBC"
+)
+
+rownames(cor_mat) <- heatmap_labels[rownames(cor_mat)]
+colnames(cor_mat) <- heatmap_labels[colnames(cor_mat)]
+
+plot_corr <- ggcorrplot(
+  cor_mat,
+  type     = "lower",
+  lab      = TRUE,
+  lab_size = 3.5,
+  colors   = c("#4477AA", "white", "#CC3311"),
+  title    = "Pearson Correlation Among Continuous Model Predictors",
+  ggtheme  = theme_proj()
+)
+
+plot_corr
+```
+
+BUN and creatinine show a moderate-to-strong positive correlation, which is expected since both reflect kidney function. We retain both in the model but will check variance inflation factors (VIFs) after fitting to quantify the collinearity.
+
+## 5.4 Age by hospital outcome
+
+```{r plot-age}
+plot_age <- df_plot %>%
+  filter(!is.na(age)) %>%
+  ggplot(aes(x = outcome, y = age, fill = outcome)) +
+  geom_boxplot(alpha = 0.75, show.legend = FALSE) +
+  scale_fill_manual(values = outcome_pal) +
+  labs(title = "Age Distribution by Hospital Outcome",
+       x = NULL, y = "Age (years)") +
+  theme_proj()
+
+plot_age
+```
+
+## 5.5 Outcome composition by ICU type
+
+```{r plot-icu-type}
+plot_icu_df <- df_plot %>%
+  filter(!is.na(icu_type)) %>%
+  count(icu_type, outcome) %>%
+  complete(icu_type, outcome, fill = list(n = 0)) %>%
+  group_by(icu_type) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+icu_order <- plot_icu_df %>%
+  filter(outcome == "Died") %>%
+  select(icu_type, died_prop = prop)
+
+plot_icu_df <- plot_icu_df %>%
+  left_join(icu_order, by = "icu_type") %>%
+  mutate(icu_type = fct_reorder(icu_type, died_prop))
+
+plot_icu <- ggplot(plot_icu_df, aes(x = icu_type, y = prop, fill = outcome)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = outcome_pal) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(
+    title = "Outcome Composition by ICU Type",
+    x     = NULL,
+    y     = "Proportion"
+  ) +
+  theme_proj()
+
+plot_icu
+```
+
+## 5.6 First-day vitals and labs by outcome (faceted)
+
+To improve readability of skewed labs, we winsorize *for visualization only* at the 99th percentile. The model uses unwinsorized values.
+
+```{r plot-faceted}
+winsorize_99 <- function(x) {
+  p99 <- quantile(x, 0.99, na.rm = TRUE)
+  pmin(x, p99)
+}
+
+vars_for_panels <- c(
+  "d1_mbp_min", "d1_spo2_min", "d1_resprate_max",
+  "d1_bun_max", "d1_creatinine_max", "d1_wbc_max"
+)
+
+df_long <- df_plot %>%
+  select(outcome, all_of(vars_for_panels)) %>%
+  mutate(
+    d1_bun_max        = winsorize_99(d1_bun_max),
+    d1_creatinine_max = winsorize_99(d1_creatinine_max),
+    d1_wbc_max        = winsorize_99(d1_wbc_max)
+  ) %>%
+  pivot_longer(-outcome, names_to = "measure", values_to = "value")
+
+label_map <- c(
+  d1_mbp_min        = "Min mean BP",
+  d1_spo2_min       = "Min SpO2",
+  d1_resprate_max   = "Max resp rate",
+  d1_bun_max        = "Max BUN",
+  d1_creatinine_max = "Max creatinine",
+  d1_wbc_max        = "Max WBC"
+)
+
+plot_facets <- ggplot(df_long, aes(x = outcome, y = value, fill = outcome)) +
+  geom_boxplot(alpha = 0.8, outlier.alpha = 0.15, show.legend = FALSE) +
+  facet_wrap(~ measure, scales = "free_y", ncol = 3,
+             labeller = as_labeller(label_map)) +
+  scale_fill_manual(values = outcome_pal) +
+  labs(title = "First-Day Vitals and Labs by Outcome",
+       x = NULL, y = NULL) +
+  theme_proj() +
+  theme(strip.text = element_text(size = 10))
+
+plot_facets
+```
+
+## 5.7 Mortality rate by age decile
+
+```{r plot-age-deciles}
+age_decile_df <- df_plot %>%
+  filter(!is.na(age)) %>%
+  mutate(age_decile = ntile(age, 10)) %>%
+  group_by(age_decile) %>%
+  summarise(
+    mortality_rate = mean(hospital_death),
+    n              = n(),
+    .groups        = "drop"
+  )
+
+plot_age_deciles <- ggplot(age_decile_df,
+                           aes(x = age_decile, y = mortality_rate)) +
+  geom_line(color = "#CC3311", linewidth = 0.8) +
+  geom_point(size = 2.5, color = "#CC3311") +
+  scale_x_continuous(breaks = 1:10) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "Mortality Rate by Age Decile",
+       x = "Age decile", y = "Mortality rate") +
+  theme_proj()
+
+plot_age_deciles
+```
+
+# 6. Primary Model: Logistic Regression
+
+We use the log-transformed pre-ICU length of stay (`log1p(pre_icu_los_days)`) to stabilize the heavy right skew in this variable (raw: mean = 0.84 days, max = 159 days).
+
+```{r fit-logistic}
+logit_fit <- glm(
+  hospital_death ~ age + gender + elective_surgery + log_pre_icu_los +
+    d1_mbp_min + d1_spo2_min + d1_resprate_max +
+    d1_creatinine_max + d1_bun_max + d1_wbc_max,
+  data   = df_model,
+  family = binomial
+)
+
+summary(logit_fit)
+```
+
+## 6.1 Variance inflation factors
+
+We check VIFs to quantify multicollinearity. Values above ~5 suggest meaningful collinearity between predictors.
+
+```{r vif-check}
+vif_vals <- car::vif(logit_fit)
+
+vif_tbl <- tibble(
+  Predictor = names(vif_vals),
+  VIF       = round(vif_vals, 2)
+) %>%
+  arrange(desc(VIF))
+
+kable(vif_tbl, caption = "Variance Inflation Factors for Logistic Regression")
+```
+
+All VIFs are expected to be modest. BUN and creatinine may show slightly elevated values due to their shared renal pathway. Creatinine's non-significance in the logistic model (p = 0.83 in the original per-unit specification) is likely due to shared variance with BUN rather than clinical irrelevance.
+
+## 6.2 Adjusted odds ratios — per unit
+
+```{r or-table}
+or_tbl <- broom::tidy(logit_fit, exponentiate = TRUE, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(term_label = case_match(term,
+    "age"                 ~ "Age (per year)",
+    "genderM"             ~ "Male gender",
+    "elective_surgeryYes" ~ "Elective surgery",
+    "log_pre_icu_los"     ~ "Pre-ICU LOS (log days)",
+    "d1_mbp_min"          ~ "Min mean BP (per mmHg)",
+    "d1_spo2_min"         ~ "Min SpO2 (per %)",
+    "d1_resprate_max"     ~ "Max resp rate (per br/min)",
+    "d1_creatinine_max"   ~ "Max creatinine (per mg/dL)",
+    "d1_bun_max"          ~ "Max BUN (per mg/dL)",
+    "d1_wbc_max"          ~ "Max WBC (per 1000/uL)"
+  ))
+
+kable(
+  or_tbl %>% select(term_label, estimate, conf.low, conf.high, p.value),
+  digits  = 4,
+  col.names = c("Predictor", "OR", "Lower 95% CI", "Upper 95% CI", "p-value"),
+  caption = "Adjusted odds ratios with 95\\% confidence intervals"
+)
+```
+
+## 6.3 Adjusted odds ratios — per IQR increase (preferred visualization)
+
+Per-unit odds ratios for continuous predictors (e.g., OR = 1.018 per year of age) are accurate but can be difficult to interpret visually because the magnitudes cluster near 1. To better convey *clinical* effect sizes, we scale each continuous predictor's log-OR by its interquartile range. This answers the question: **"How much does mortality risk change when a predictor moves across the middle 50% of patients?"**
+
+```{r plot-or-iqr, fig.height=7}
+# Compute IQR for each continuous predictor in the model data
+iqr_lookup <- df_model %>%
+  summarise(across(
+    c(age, log_pre_icu_los, d1_mbp_min, d1_spo2_min,
+      d1_resprate_max, d1_creatinine_max, d1_bun_max, d1_wbc_max),
+    ~ IQR(., na.rm = TRUE)
+  )) %>%
+  pivot_longer(everything(), names_to = "term", values_to = "iqr_val")
+
+# Merge IQR values with coefficient estimates (on log scale)
+or_iqr <- broom::tidy(logit_fit, conf.int = TRUE) %>%
+  filter(term != "(Intercept)") %>%
+  left_join(iqr_lookup, by = "term") %>%
+  mutate(
+    # Binary/factor terms: IQR not applicable, keep OR as-is
+    iqr_val = if_else(is.na(iqr_val), 1, iqr_val),
+    or_iqr  = exp(estimate * iqr_val),
+    lo_iqr  = exp(conf.low  * iqr_val),
+    hi_iqr  = exp(conf.high * iqr_val),
+   label = case_match(term,
+      "age"                 ~ "Age",
+      "genderM"             ~ "Male gender",
+      "elective_surgeryYes" ~ "Elective surgery",
+      "log_pre_icu_los"     ~ "Pre-ICU LOS (log)",
+      "d1_mbp_min"          ~ "Min mean BP",
+      "d1_spo2_min"         ~ "Min SpO2",
+      "d1_resprate_max"     ~ "Max resp rate",
+      "d1_creatinine_max"   ~ "Max creatinine",
+      "d1_bun_max"          ~ "Max BUN",
+      "d1_wbc_max"          ~ "Max WBC"
+    ),
+    # Annotate continuous predictors with their IQR
+    label = if_else(
+      iqr_val != 1,
+      paste0(label, " (IQR = ", round(iqr_val, 1), ")"),
+      label
+    )
+  )
+
+plot_or_iqr <- ggplot(or_iqr, aes(x = or_iqr, y = reorder(label, or_iqr))) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_point(size = 2.5, color = "#CC3311") +
+  geom_errorbarh(aes(xmin = lo_iqr, xmax = hi_iqr),
+                 height = 0.25, linewidth = 0.6) +
+  scale_x_log10(labels = number_format(accuracy = 0.01)) +
+  labs(
+    title    = "Adjusted Odds Ratios per IQR Increase",
+    subtitle = "How much does mortality odds change across the typical patient range?",
+    x        = "Odds ratio (log scale)",
+    y        = NULL
+  ) +
+  theme_proj()
+
+plot_or_iqr
+```
+
+## 6.4 Adjusted odds ratios — per unit (log-scale forest plot)
+
+For completeness, we also present the traditional per-unit odds ratio forest plot using a log-scale x-axis to avoid visual compression from elective surgery's strong protective effect.
+
+```{r plot-or-log}
+plot_or_log <- ggplot(or_tbl, aes(x = estimate, y = reorder(term_label, estimate))) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_point(size = 2.5, color = "#CC3311") +
+  geom_errorbarh(aes(xmin = conf.low, xmax = conf.high),
+                 height = 0.25, linewidth = 0.6) +
+  scale_x_log10(
+    breaks = c(0.3, 0.5, 0.75, 1, 1.05, 1.1, 1.5),
+    labels = number_format(accuracy = 0.01)
+  ) +
+  labs(
+    title    = "Adjusted Odds Ratios — Per Unit (Logistic Regression)",
+    subtitle = "Log scale; reference line at OR = 1",
+    x        = "Odds ratio (log scale)",
+    y        = NULL
+  ) +
+  theme_proj()
+
+plot_or_log
+```
+
+## 6.5 LightGBM with 5-Fold Cross-Validation
+
+```{r}
+# Prepare feature matrix and label
+
+X_train <- df_lgbm %>% 
+  select(-hospital_death) %>%
+  as.matrix()
+
+y_train <- df_lgbm$hospital_death
+
+# LightGBM parameters
+
+lgbm_params <- list(
+  objective        = "binary",
+  metric           = "auc",
+  learning_rate    = 0.05,
+  num_leaves       = 63,
+  max_depth        = -1,
+  min_data_in_leaf = 50,
+  feature_fraction = 0.8,
+  bagging_fraction = 0.8,
+  bagging_freq     = 5,
+  scale_pos_weight = sum(y_train == 0) / sum(y_train == 1),  # handles class imbalance
+  verbose          = -1
+)
+
+# 5-fold stratified cross-validation
+set.seed (305)
+folds <- caret::createFolds(y_train, k = 5, list = TRUE, returnTrain = FALSE)
+
+cv_results <- purrr::imap_dfr(folds, function(val_idx, fold_name) {
+  train_idx <- setdiff(seq_len(nrow(X_train)), val_idx)
+  
+  dtrain <- lgb.Dataset(X_train[train_idx, ], label = y_train[train_idx])
+  
+  fit <- lgb.train(
+    params  = lgbm_params,
+    data    = dtrain,
+    nrounds = 500,
+    verbose = -1
+  )
+  
+  preds <- predict(fit, X_train[val_idx, ])
+  auc   <- as.numeric(pROC::auc(
+    pROC::roc(y_train[val_idx], preds, quiet = TRUE)
+  ))
+  
+  tibble(fold = fold_name, auc = auc, n_val = length(val_idx))
+})
+
+kable(
+  cv_results %>%
+    bind_rows(
+      tibble(fold = "Mean ± SD",
+             auc  = mean(cv_results$auc),
+             n_val = NA)
+    ),
+  digits = 4,
+  caption = paste0(
+    "5-Fold CV AUC: ", round(mean(cv_results$auc), 4),
+    " ± ", round(sd(cv_results$auc), 4)
+  )
+)
+```
+
+```{r}
+# Fit final model on ALL training data for submission
+dtrain_full <- lgb.Dataset(X_train, label = y_train)
+
+lgbm_final <- lgb.train(
+  params  = lgbm_params,
+  data    = dtrain_full,
+  nrounds = 500,
+  verbose = -1
+)
+```
+
+
+```{r}
+# Feature importance — top 20
+importance_df <- lgb.importance(lgbm_final, percentage = TRUE) %>%
+  as_tibble() %>%
+  slice_max(Gain, n = 20)
+
+plot_importance <- ggplot(
+  importance_df,
+  aes(x = Gain, y = reorder(Feature, Gain))
+) +
+  geom_col(fill = "#4477AA") +
+  labs(
+    title = "LightGBM Feature Importance (Top 20 by Gain)",
+    x = "Gain (%)", y = NULL
+  ) +
+  theme_proj()
+
+plot_importance
+```
+
+```{r}
+# Compare logistic vs. LightGBM in-sample (for reference)
+lgbm_train_pred <- predict(lgbm_final, X_train)
+lgbm_auc <- as.numeric(pROC::auc(
+  pROC::roc(y_train, lgbm_train_pred, quiet = TRUE)
+))
+
+# Compute logistic AUC here rather than relying on auc_val from Section 7.1
+logit_train_pred <- predict(logit_fit, type = "response")
+logit_auc_insample <- as.numeric(pROC::auc(
+  pROC::roc(df_model$outcome, logit_train_pred,
+            levels = c("Survived", "Died"), quiet = TRUE)
+))
+
+tibble(
+  Model = c("Logistic regression (in-sample)", "LightGBM (5-fold CV mean)"),
+  AUC   = c(round(logit_auc_insample, 4), round(mean(cv_results$auc), 4)),
+  Note  = c("Apparent — optimistic", "Cross-validated — realistic")
+) %>%
+  kable(caption = "Model comparison")
+```
+
+
+
+# 7. Model Diagnostics (Apparent / In-sample)
+
+## 7.1 ROC curve and AUC
+
+```{r roc}
+df_model <- df_model %>%
+  mutate(pred_prob = predict(logit_fit, type = "response"))
+
+roc_obj <- pROC::roc(df_model$outcome, df_model$pred_prob,
+                     levels = c("Survived", "Died"), quiet = TRUE)
+auc_val <- as.numeric(pROC::auc(roc_obj))
+
+roc_df <- tibble(
+  fpr = 1 - roc_obj$specificities,
+  tpr = roc_obj$sensitivities
+)
+
+plot_roc <- ggplot(roc_df, aes(x = fpr, y = tpr)) +
+  geom_line(linewidth = 1, color = "#CC3311") +
+  geom_abline(linetype = 2, color = "grey50") +
+  annotate("text", x = 0.6, y = 0.3,
+           label = paste0("AUC = ", round(auc_val, 3)),
+           size = 5, fontface = "bold", color = "#CC3311") +
+  labs(title = "ROC Curve",
+       x     = "False positive rate",
+       y     = "True positive rate") +
+  theme_proj()
+
+plot_roc
+```
+
+## 7.2 Calibration plot by risk decile
+
+```{r calibration}
+calib_df <- df_model %>%
+  mutate(decile = ntile(pred_prob, 10)) %>%
+  group_by(decile) %>%
+  summarise(
+    mean_pred = mean(pred_prob),
+    obs_rate  = mean(outcome == "Died"),
+    n         = n(),
+    .groups   = "drop"
+  )
+
+plot_calib <- ggplot(calib_df, aes(x = mean_pred, y = obs_rate)) +
+  geom_abline(linetype = "dashed", color = "grey50") +
+  geom_point(size = 3, color = "#CC3311") +
+  geom_line(color = "#CC3311", linewidth = 0.7) +
+  labs(title    = "Calibration Plot (10 Bins)",
+       subtitle = "Points near the diagonal indicate good calibration",
+       x        = "Mean predicted probability",
+       y        = "Observed mortality rate") +
+  theme_proj()
+
+plot_calib
+```
+
+## 7.3 Predicted probability distribution by outcome
+
+This visualization directly shows how well the model separates survivors from non-survivors. Greater separation between the two density curves indicates stronger discrimination.
+
+```{r plot-pred-density}
+plot_density <- ggplot(df_model, aes(x = pred_prob, fill = outcome)) +
+  geom_density(alpha = 0.55, color = NA) +
+  geom_rug(aes(color = outcome), alpha = 0.03, sides = "b") +
+  scale_fill_manual(values = outcome_pal) +
+  scale_color_manual(values = outcome_pal) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title    = "Distribution of Predicted Mortality Probability by Outcome",
+    subtitle = "Separation between curves reflects model discrimination",
+    x        = "Predicted probability of death",
+    y        = "Density",
+    fill     = "Outcome",
+    color    = "Outcome"
+  ) +
+  theme_proj()
+
+plot_density
+```
+
+The overlap region represents patients the model has difficulty classifying. The rightward tail of the "Died" curve shows patients the model correctly flags as high-risk. Most survivors cluster at very low predicted probabilities, which is consistent with the low overall mortality rate (~9%).
+
+# 8. Sensitivity Analysis: Linear Probability Model
+
+This model is included as a *communication-friendly* sensitivity check. Logistic regression remains the primary model. The variable set matches the logistic specification for a direct comparison.
+
+```{r lpm}
+df_model <- df_model %>%
+  mutate(hospital_death_num = if_else(outcome == "Died", 1, 0))
+
+lpm_fit <- lm(
+  hospital_death_num ~ age + gender + elective_surgery + log_pre_icu_los +
+    d1_mbp_min + d1_spo2_min + d1_resprate_max +
+    d1_creatinine_max + d1_bun_max + d1_wbc_max,
+  data = df_model
+)
+
+summary(lpm_fit)
+```
+
+The direction and relative magnitudes of the LPM coefficients are consistent with the logistic regression, supporting the robustness of our findings. Note that unlike the logistic model, the LPM can produce predicted probabilities outside [0, 1], which is a known limitation of this approach.
+
+# 9. Kaggle Generation Submission
+
+
+This final section fits the selected logistic regression model on the full labeled training data, applies the same preprocessing to the unlabeled data, and exports a Kaggle-ready submission file containing predicted probabilities for hospital mortality.
+
+
+```{r}
+# Load test data
+test_raw <- read_csv("unlabeled.csv", show_col_types = FALSE)
+
+# ── Encode test categoricals using training factor levels ─────────────────────
+test_encoded <- test_raw %>%
+  mutate(across(
+    c(gender, ethnicity, icu_type, icu_admit_source, hospital_admit_source),
+    ~ as.integer(factor(.x, levels = encode_levels[[cur_column()]]))
+  ))
+
+# ── Build test feature matrix (same column order as training) ─────────────────
+test_features <- test_encoded %>%
+  select(all_of(setdiff(lgbm_vars, "hospital_death")))
+
+# Check column alignment
+stopifnot(all(colnames(test_features) == colnames(X_train)))
+
+X_test <- as.matrix(test_features)
+
+# ── LightGBM predictions ──────────────────────────────────────────────────────
+lgbm_preds <- predict(lgbm_final, X_test)
+
+# NA check — LightGBM will still produce a prediction for rows with partial
+# missingness (it routes NAs in its tree splits). Fully unrecognized factor
+# levels get NA. Report how many, then fall back to training prevalence.
+n_na_lgbm <- sum(is.na(lgbm_preds))
+cat("LightGBM NA predictions:", n_na_lgbm, "of", length(lgbm_preds), "\n")
+
+if (n_na_lgbm > 0) {
+  lgbm_preds[is.na(lgbm_preds)] <- mean(y_train)
+  cat("Fallback applied: training prevalence =", round(mean(y_train), 4), "\n")
+}
+
+# ── Write primary submission (LightGBM) ───────────────────────────────────────
+submission_lgbm <- tibble(
+  encounter_id   = test_raw$encounter_id,
+  hospital_death = lgbm_preds
+)
+write_csv(submission_lgbm, "submission_lgbm.csv")
+
+# ── Write logistic regression submission for comparison ───────────────────────
+# (Rerun logistic preprocessing on test set)
+test_logistic <- test_raw %>%
+  mutate(
+    gender           = factor(gender),
+    elective_surgery = factor(elective_surgery, levels = c(0, 1), labels = c("No", "Yes")),
+    log_pre_icu_los  = log1p(pre_icu_los_days)
+  )
+
+logit_preds <- predict(logit_fit, newdata = test_logistic, type = "response")
+n_na_logit  <- sum(is.na(logit_preds))
+cat("Logistic NA predictions:", n_na_logit, "\n")
+logit_preds[is.na(logit_preds)] <- mean(y_train)
+
+submission_logit <- tibble(
+  encounter_id   = test_raw$encounter_id,
+  hospital_death = logit_preds
+)
+write_csv(submission_logit, "submission_logit.csv")
+
+# ── Preview both submissions ──────────────────────────────────────────────────
+bind_rows(
+  head(submission_lgbm, 6)  %>% mutate(model = "LightGBM"),
+  head(submission_logit, 6) %>% mutate(model = "Logistic")
+) %>%
+  kable(digits = 4, caption = "Submission preview — first 6 rows from each model")
+```
+
+
+
+# 10. Conclusions
+
+## Key findings
+
+In this cohort of `r format(nrow(wi_ds), big.mark = ",")` ICU admissions, hospital mortality occurred in approximately 9% of patients. Several first-day measurements showed strong, independent associations with in-hospital death:
+
+- **Elective surgery** was the single strongest protective factor, with patients admitted for planned procedures showing substantially lower mortality odds than emergency admissions.
+- **Hemodynamic instability** (lower first-day minimum mean blood pressure) and **impaired oxygenation** (lower minimum SpO2) were each independently associated with higher mortality, consistent with known prognostic indicators in critical care.
+- **Markers of organ stress** --- higher maximum respiratory rate, elevated BUN, and elevated WBC count --- were associated with higher mortality, reflecting systemic physiologic derangement.
+- **Age** showed a monotonically increasing relationship with mortality across deciles.
+- **Creatinine** was not significant in the multivariable model despite clinical relevance; this is likely attributable to collinearity with BUN (both measure renal function), as supported by the correlation heatmap and VIF analysis.
+- The logistic regression achieved moderate discrimination (AUC ≈ 0.78) with good apparent calibration, and the predicted probability density plot confirms reasonable separation between survivors and non-survivors.
+
+## Limitations
+
+- Analyses are observational and descriptive; no causal claims can be made.
+- Complete-case analysis drops ~22% of observations; the bias check in Section 4.1 should be consulted to assess whether this introduces systematic bias.
+- ROC, calibration, and the predicted probability plot are **apparent (in-sample) diagnostics** rather than independent validation. External or cross-validated performance would be needed to assess generalizability.
+- Pre-ICU length of stay was log-transformed to address extreme right skew; coefficients should be interpreted on the log scale.
+- The model uses a parsimonious set of 10 predictors. Additional variables (e.g., APACHE scores, comorbidity indices) could improve discrimination but would reduce interpretability.
+
+
+```{r session-info}
+sessionInfo()
+```

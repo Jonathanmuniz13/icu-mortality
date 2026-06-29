@@ -1,0 +1,25 @@
+# R session / workspace
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+
+# RMarkdown knit intermediates & caches
+*_cache/
+*_files/
+*.knit.md
+*.utf8.md
+
+# Editor / OS
+.DS_Store
+.vscode/
+.ipynb_checkpoints/
+
+# WiDS Datathon 2020 data — license-restricted, NOT redistributable (see README)
+training_v2.csv
+unlabeled.csv
+
+# Regenerable model outputs
+submission_lgbm.csv
+submission_logit.csv
